@@ -3761,8 +3761,10 @@ function getApiKey() {
 
 async function loadApiKey() {
   let key = null;
-  const isBlob = location.protocol === 'blob:';
-  if(!isBlob) { try { key = await withTimeout(idbGet(API_KEY_STORAGE), 2000, null); } catch(e) {} }
+  const proto = location.protocol;
+  if(proto === 'https:' || proto === 'http:') {
+    try { key = await withTimeout(idbGet(API_KEY_STORAGE), 3000, null); } catch(e) {}
+  }
   if(!key) { try { key = localStorage.getItem(API_KEY_STORAGE); } catch(e) {} }
   _cachedApiKey = key || '';
   return _cachedApiKey;
@@ -3773,9 +3775,11 @@ function saveApiKey() {
   if(!val){ toast('Digite a chave de API.','error'); return; }
   if(!val.startsWith('sk-ant-')){ toast('Chave inválida — deve começar com sk-ant-','error'); return; }
   _cachedApiKey = val;
-  // Save to both storages for maximum compatibility
-  idbSet(API_KEY_STORAGE, val).catch(()=>{});
+  // Salva em ambos para máxima compatibilidade
   try { localStorage.setItem(API_KEY_STORAGE, val); } catch(e) {}
+  idbSet(API_KEY_STORAGE, val).catch(()=>{
+    setTimeout(()=>idbSet(API_KEY_STORAGE, val).catch(()=>{}), 500);
+  });
   updateApiKeyStatus();
   toast('Chave de API salva!');
 }
@@ -3895,13 +3899,30 @@ function saveToStorage() {
     nextEvalId:     state.nextEvalId,
     nextResultId:   state.nextResultId,
   });
-  // Always write localStorage (shared with blob: tab on same device)
+
+  // 1. localStorage — síncrono, sempre funciona (principal no blob:/content://)
   try { localStorage.setItem(STORAGE_KEY, payload); } catch(e) {}
-  // Also write IndexedDB for content:// persistence
-  idbSet(STORAGE_KEY, payload).catch(()=>{});
+
+  // 2. IndexedDB — assíncrono, principal no HTTPS (GitHub Pages)
+  //    Não bloqueia a UI — fire-and-forget com retry
+  (async () => {
+    try {
+      await idbSet(STORAGE_KEY, payload);
+    } catch(e) {
+      // Retry once after 500ms
+      setTimeout(async () => {
+        try { await idbSet(STORAGE_KEY, payload); } catch(e2) {}
+      }, 500);
+    }
+  })();
+
   // Flash save indicator
   const ind = document.getElementById('nav-save-indicator');
-  if(ind){ ind.style.display='inline'; ind.style.color='var(--teal)'; setTimeout(()=>{ ind.style.color='var(--muted)'; }, 1500); }
+  if(ind){
+    ind.style.display = 'inline';
+    ind.style.color   = 'var(--teal)';
+    setTimeout(()=>{ ind.style.color = 'var(--muted)'; }, 1500);
+  }
 }
 
 // Wrapper: resolve com valor fallback após timeout (evita travamento em content://)
@@ -3914,10 +3935,14 @@ function withTimeout(promise, ms, fallback=null) {
 
 async function loadFromStorage() {
   let raw = null;
-  const isBlob = location.protocol === 'blob:';
-  if(!isBlob) {
-    try { raw = await withTimeout(idbGet(STORAGE_KEY), 2000, null); } catch(e) {}
+  const proto = location.protocol;
+
+  // Em HTTPS (GitHub Pages): IndexedDB é persistente — usar como fonte principal
+  // Em blob:/content://: IndexedDB pode travar — usar localStorage direto
+  if(proto === 'https:' || proto === 'http:') {
+    try { raw = await withTimeout(idbGet(STORAGE_KEY), 3000, null); } catch(e) {}
   }
+  // Fallback sempre: localStorage
   if(!raw) { try { raw = localStorage.getItem(STORAGE_KEY); } catch(e) {} }
   if(!raw) return false;
   try {
@@ -3930,23 +3955,6 @@ async function loadFromStorage() {
     if(saved.nextResultId)  state.nextResultId  = saved.nextResultId;
     return true;
   } catch(e) { return false; }
-}
-
-// Auto-save on every state mutation — patch key functions
-const _origSaveStudent = saveStudent;
-const _origSaveEval    = saveEval;
-const _origDeleteStudent = deleteStudent;
-const _origDeleteEval  = deleteEval;
-const _origSaveResult  = saveResult;
-const _origDeleteResult= deleteResult;
-const _origConfirmImport = confirmImport;
-
-// Wrap with auto-save (re-define after all functions exist)
-function withSave(fn) {
-  return function(...args) {
-    fn.apply(this, args);
-    saveToStorage();
-  };
 }
 
 // ─── BACKUP / RESTORE ────────────────────────────────────
@@ -4023,18 +4031,26 @@ function clearAllData() {
 // ═══════════════════════════════════════════════════════
 document.getElementById('e-date').value = new Date().toISOString().split('T')[0];
 
-// Wire auto-save to all state-mutating functions
-const _save = saveToStorage;
-
-['saveStudent','saveEval','deleteStudent','deleteEval','saveResult','deleteResult','saveAnswerKey'].forEach(name=>{
-  const orig = window[name];
-  window[name] = function(...args){ orig.apply(this,args); _save(); };
-});
-const _origCI = confirmImport;
-confirmImport = function(){
-  _origCI.apply(this, arguments);
-  _save();
-};
+// Auto-save: patch todas as funções que mutam state
+// Executado uma única vez após todas as funções estarem definidas
+(function patchStateMutators() {
+  const fns = ['saveStudent','saveEval','deleteStudent','deleteEval',
+                'saveResult','deleteResult','saveAnswerKey'];
+  fns.forEach(name => {
+    const orig = window[name];
+    if(typeof orig !== 'function') return;
+    window[name] = function(...args) {
+      orig.apply(this, args);
+      saveToStorage();
+    };
+  });
+  // confirmImport precisa de tratamento especial (é function declaration)
+  const _origCI = window.confirmImport;
+  window.confirmImport = function() {
+    _origCI.apply(this, arguments);
+    saveToStorage();
+  };
+})();
 
 // ═══════════════════════════════════════════════════════
 // BOOT — renderiza imediatamente, carrega dados em background
